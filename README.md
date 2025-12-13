@@ -1,9 +1,12 @@
-# Fabric Example Mod
+# Always Online (Fabric)
 
-## Setup
+Server-only Fabric mod for 1.21.10 that advertises fake players:
+- Adds five generated names to the server list ping response.
+- Appends those same names to every `ClientboundPlayerInfoUpdatePacket`, so they appear in the in-game tab list and count.
+- No actual entities are created; it only touches status and tab packets.
 
-For setup instructions please see the [fabric documentation page](https://docs.fabricmc.net/develop/getting-started/setting-up) that relates to the IDE that you are using.
+### Building
+Run `./gradlew build` to produce the mod jar in `build/libs/`.
 
-## License
-
-This template is available under the CC0 license. Feel free to learn from it and incorporate it in your own projects.
+### Tweaking the names/count
+The constants and name pools live in `src/main/java/com/example/ExampleMod.java` (`FAKE_PLAYER_COUNT`, `randomName`). Adjust them and rebuild if you want different names or a different number of always-online players.

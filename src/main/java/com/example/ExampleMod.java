@@ -1,53 +1,82 @@
 package com.example;
 
+import com.example.config.FakePlayerConfig;
+import com.example.config.FakePlayerConfigManager;
+import com.mojang.authlib.GameProfile;
 import net.fabricmc.api.ModInitializer;
-
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
+import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
+import net.minecraft.network.protocol.game.ClientboundTabListPacket;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.RemoteChatSession;
+import net.minecraft.network.protocol.status.ServerStatus;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.players.NameAndId;
+import net.minecraft.server.players.PlayerList;
+import net.minecraft.world.level.GameType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ThreadLocalRandom;
-
-import com.mojang.authlib.GameProfile;
-import net.minecraft.network.protocol.status.ServerStatus;
-import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket;
-import net.minecraft.server.players.NameAndId;
-import net.minecraft.server.players.PlayerList;
-import net.minecraft.network.chat.Component;
-import net.minecraft.world.level.GameType;
-import net.minecraft.network.chat.RemoteChatSession;
 
 public class ExampleMod implements ModInitializer {
 	public static final String MOD_ID = "modid";
 
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-	private static final int FAKE_PLAYER_COUNT = 5;
-	private static final List<NameAndId> FAKE_PLAYERS = Collections.unmodifiableList(generateFakePlayers());
-	private static final List<ClientboundPlayerInfoUpdatePacket.Entry> FAKE_TAB_ENTRIES = Collections.unmodifiableList(buildFakeEntries());
+	private static FakePlayerConfig CONFIG;
+	public static final FakePlayerScheduler SCHEDULER = new FakePlayerScheduler();
 
 	@Override
 	public void onInitialize() {
-		LOGGER.info("Loaded fake player list with {} always-online players.", FAKE_PLAYERS.size());
+		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+			SCHEDULER.bind(server);
+			FakePlayerConfigManager.loadOrCreate(server);
+			CONFIG = FakePlayerConfigManager.getConfig();
+			LOGGER.info("Loaded fake player scheduler with {} configured bots.", CONFIG.bots.size());
+			refreshTabListForAllRealPlayers(server);
+		});
+
+		ServerLifecycleEvents.SERVER_STOPPED.register(server -> SCHEDULER.shutdown());
+		ServerTickEvents.END_SERVER_TICK.register(SCHEDULER::tick);
+		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+			SCHEDULER.handleRealPlayerJoin(handler.player);
+			refreshTabListForAllRealPlayers(server);
+		});
+		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> refreshTabListForAllRealPlayers(server));
+		SilentBlocker.register();
+		FakePlayerCommands.register(SCHEDULER);
+	}
+
+	public static FakePlayerConfig getFakePlayerConfig() {
+		return CONFIG;
+	}
+
+	public static FakePlayerScheduler getScheduler() {
+		return SCHEDULER;
 	}
 
 	public static List<NameAndId> getFakePlayers() {
-		return FAKE_PLAYERS;
+		return SCHEDULER.getActivePlayers();
 	}
 
 	public static List<ClientboundPlayerInfoUpdatePacket.Entry> getFakeTabEntries() {
-		return FAKE_TAB_ENTRIES;
+		return SCHEDULER.getActiveTabEntries();
 	}
 
 	public static ServerStatus withFakePlayers(ServerStatus status, PlayerList playerList) {
 		int realCount = playerList.getPlayerCount();
-		int maxPlayers = Math.max(playerList.getMaxPlayers(), realCount + FAKE_PLAYERS.size());
+		int fakeCount = SCHEDULER.getActivePlayers().size();
+		int maxPlayers = Math.max(playerList.getMaxPlayers(), realCount + fakeCount);
 
 		List<NameAndId> sample = new ArrayList<>(status.players()
 			.map(ServerStatus.Players::sample)
@@ -58,59 +87,75 @@ public class ExampleMod implements ModInitializer {
 			seenNames.add(existing.name().toLowerCase(Locale.ROOT));
 		}
 
-		for (NameAndId fake : FAKE_PLAYERS) {
+		for (NameAndId fake : SCHEDULER.getActivePlayers()) {
 			if (seenNames.add(fake.name().toLowerCase(Locale.ROOT))) {
 				sample.add(fake);
 			}
 		}
 
-		ServerStatus.Players players = new ServerStatus.Players(maxPlayers, realCount + FAKE_PLAYERS.size(), sample);
+		ServerStatus.Players players = new ServerStatus.Players(maxPlayers, realCount + fakeCount, sample);
 		return new ServerStatus(status.description(), Optional.of(players), status.version(), status.favicon(), status.enforcesSecureChat());
 	}
 
-	private static List<NameAndId> generateFakePlayers() {
-		ThreadLocalRandom random = ThreadLocalRandom.current();
-		List<NameAndId> players = new ArrayList<>(FAKE_PLAYER_COUNT);
+	public static ClientboundPlayerInfoUpdatePacket.Entry toEntry(NameAndId fake) {
+		GameProfile profile = new GameProfile(fake.id(), fake.name());
+		Component displayName = Component.literal(fake.name());
+		// Listed=true, latency=0, gamemode=survival, display name for tab, no hat, list order=0, no chat session
+		return new ClientboundPlayerInfoUpdatePacket.Entry(
+			profile.id(),
+			profile,
+			true,
+			0,
+			GameType.SURVIVAL,
+			displayName,
+			false,
+			0,
+			(RemoteChatSession.Data) null
+		);
+	}
 
-		for (int i = 0; i < FAKE_PLAYER_COUNT; i++) {
-			String name = randomName(random);
-			players.add(new NameAndId(UUID.randomUUID(), name));
+	public static void refreshTabListForAllRealPlayers(net.minecraft.server.MinecraftServer server) {
+		int realCount = server.getPlayerList().getPlayerCount();
+		var fakeEntries = getFakeTabEntries();
+		int fakeCount = fakeEntries.size();
+		int total = realCount + fakeCount;
+		LOGGER.info("[FakePlayers] Refreshing tab list: real={}, fake={}, total={}", realCount, fakeCount, total);
+		for (var entry : fakeEntries) {
+			LOGGER.info("[FakePlayers] TAB entry: {} ({})", entry.profile().name(), entry.profile().id());
 		}
 
-		return players;
-	}
+		// Send header/footer with total count
+		Component header = Component.literal("Welcome");
+		Component footer = Component.literal("Players online: " + total);
+		ClientboundTabListPacket tabPacket = new ClientboundTabListPacket(header, footer);
 
-	private static String randomName(ThreadLocalRandom random) {
-		String[] first = {"Nova", "Echo", "Quartz", "Vapor", "Fable", "Orbit", "Pixel", "Jade", "Onyx", "Rune"};
-		String[] second = {"Drifter", "Scribe", "Wanderer", "Whisper", "Runner", "Warden", "Diver", "Glider", "Smith", "Caster"};
-
-		String primary = first[random.nextInt(first.length)];
-		String suffix = second[random.nextInt(second.length)];
-		int digits = random.nextInt(10, 99);
-		return primary + suffix + digits;
-	}
-
-	private static List<ClientboundPlayerInfoUpdatePacket.Entry> buildFakeEntries() {
-		List<ClientboundPlayerInfoUpdatePacket.Entry> entries = new ArrayList<>(FAKE_PLAYER_COUNT);
-
-		for (NameAndId fake : FAKE_PLAYERS) {
-			GameProfile profile = new GameProfile(fake.id(), fake.name());
-			Component displayName = Component.literal(fake.name());
-			// Listed=true, latency=0, gamemode=survival, display name for tab, no hat, list order=0, no chat session
-			ClientboundPlayerInfoUpdatePacket.Entry entry = new ClientboundPlayerInfoUpdatePacket.Entry(
-				profile.id(),
-				profile,
-				true,
-				0,
-				GameType.SURVIVAL,
-				displayName,
-				false,
-				0,
-				(RemoteChatSession.Data) null
+		// Remove current fake entries
+		if (fakeCount > 0) {
+			ClientboundPlayerInfoRemovePacket remove = new ClientboundPlayerInfoRemovePacket(
+				SCHEDULER.getActivePlayers().stream().map(NameAndId::id).toList()
 			);
-			entries.add(entry);
+			server.getPlayerList().broadcastAll(remove);
 		}
 
-		return entries;
+		EnumSet<ClientboundPlayerInfoUpdatePacket.Action> actions = EnumSet.of(
+			ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
+			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_GAME_MODE,
+			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
+			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY,
+			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_DISPLAY_NAME
+		);
+
+		for (ServerPlayer viewer : server.getPlayerList().getPlayers()) {
+			ClientboundPlayerInfoUpdatePacket addPacket = new ClientboundPlayerInfoUpdatePacket(
+				actions,
+				java.util.Collections.emptyList()
+			);
+			var acc = (com.example.mixin.ClientboundPlayerInfoUpdatePacketAccessor) addPacket;
+			acc.setEntries(fakeEntries);
+			LOGGER.info("[FakePlayers] Packet entries about to send: {}", acc.getEntries().size());
+			viewer.connection.send(addPacket);
+			viewer.connection.send(tabPacket);
+			LOGGER.info("[FakePlayers] Sent tab refresh to {} ({} fake entries)", viewer.getGameProfile().name(), fakeEntries.size());
+		}
 	}
 }
