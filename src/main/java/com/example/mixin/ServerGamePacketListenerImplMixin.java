@@ -14,11 +14,14 @@ public class ServerGamePacketListenerImplMixin {
 	@Inject(method = "send(Lnet/minecraft/network/protocol/Packet;)V", at = @At("HEAD"))
 	private void logPlayerInfoPackets(Packet<?> packet, CallbackInfo ci) {
 		if (packet instanceof ClientboundPlayerInfoUpdatePacket info) {
+			if (!ExampleMod.LOGGER.isDebugEnabled()) {
+				return;
+			}
 			var acc = (ClientboundPlayerInfoUpdatePacketAccessor) info;
 			int size = acc.getEntries().size();
-			ExampleMod.LOGGER.info("[FakePlayers] Outgoing PlayerInfo packet entries: {}", size);
+			ExampleMod.LOGGER.debug("[FakePlayers] Outgoing PlayerInfo packet entries: {}", size);
 			for (var entry : acc.getEntries()) {
-				ExampleMod.LOGGER.info("[FakePlayers]  -> {} ({})", entry.profile().name(), entry.profile().id());
+				ExampleMod.LOGGER.debug("[FakePlayers]  -> {} ({})", entry.profile().name(), entry.profile().id());
 			}
 		}
 	}

@@ -9,4 +9,6 @@ public class GlobalConfig {
 	public int maxBreakMinutes = 30;
 	public int minIntervalMinutes = 20;
 	public int maxIntervalMinutes = 60;
+	public int minDeathMinutes = 45;
+	public int maxDeathMinutes = 180;
 }

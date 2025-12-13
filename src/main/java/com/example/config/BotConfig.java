@@ -10,6 +10,9 @@ public class BotConfig {
 	public String name;
 	public String uuid;
 	public boolean enabled = true;
+	public String skinUuid;
+	public String textureValue;
+	public String textureSignature;
 	public List<ActiveWindowConfig> activeWindows = new ArrayList<>();
 
 	/**

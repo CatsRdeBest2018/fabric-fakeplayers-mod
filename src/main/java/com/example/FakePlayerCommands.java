@@ -3,9 +3,7 @@ package com.example;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.context.CommandContext;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
 
 import static net.minecraft.commands.Commands.literal;
@@ -29,14 +27,20 @@ public final class FakePlayerCommands {
 				.then(literal("force").executes(ctx -> force(ctx, scheduler)))
 				.then(literal("schedule").executes(ctx -> schedule(ctx, scheduler)))
 				.then(literal("reload").executes(ctx -> reload(ctx)))
+				.then(literal("enable").executes(ctx -> enable(ctx, scheduler)))
+				.then(literal("disable").executes(ctx -> disable(ctx, scheduler)))
 				.then(literal("list").executes(ctx -> list(ctx, scheduler)))
 		);
 	}
 
 	private static int force(CommandContext<CommandSourceStack> ctx, FakePlayerScheduler scheduler) {
-		scheduler.forceOnlineAll();
-		ctx.getSource().sendSuccess(() -> Component.literal("Fake players forced online."), false);
-		return 1;
+		boolean applied = scheduler.forceOnlineAll();
+		if (applied) {
+			ctx.getSource().sendSuccess(() -> Component.literal("Fake players forced online."), false);
+		} else {
+			ctx.getSource().sendFailure(Component.literal("Fake players disabled globally; enable them in config first."));
+		}
+		return applied ? 1 : 0;
 	}
 
 	private static int schedule(CommandContext<CommandSourceStack> ctx, FakePlayerScheduler scheduler) {
@@ -53,6 +57,26 @@ public final class FakePlayerCommands {
 			ctx.getSource().sendFailure(Component.literal("Failed to reload fake player config. See log for details."));
 		}
 		return ok ? 1 : 0;
+	}
+
+	private static int enable(CommandContext<CommandSourceStack> ctx, FakePlayerScheduler scheduler) {
+		boolean changed = scheduler.enable();
+		if (changed) {
+			ctx.getSource().sendSuccess(() -> Component.literal("Fake players enabled."), true);
+			return 1;
+		}
+		ctx.getSource().sendFailure(Component.literal("Fake players are already enabled."));
+		return 0;
+	}
+
+	private static int disable(CommandContext<CommandSourceStack> ctx, FakePlayerScheduler scheduler) {
+		boolean changed = scheduler.disable();
+		if (changed) {
+			ctx.getSource().sendSuccess(() -> Component.literal("Fake players disabled. All fake players went offline."), true);
+			return 1;
+		}
+		ctx.getSource().sendFailure(Component.literal("Fake players are already disabled."));
+		return 0;
 	}
 
 	private static int list(CommandContext<CommandSourceStack> ctx, FakePlayerScheduler scheduler) {
@@ -76,6 +100,9 @@ public final class FakePlayerCommands {
 				} else {
 					if (status.nextBreakStart() != null) {
 						sb.append(", next break at ").append(status.nextBreakStart().toLocalTime());
+					}
+					if (status.nextDeath() != null) {
+						sb.append(", next death at ").append(status.nextDeath().toLocalTime());
 					}
 				}
 			} else {

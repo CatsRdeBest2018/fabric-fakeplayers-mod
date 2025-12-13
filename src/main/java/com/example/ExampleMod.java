@@ -21,7 +21,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.List;
@@ -97,9 +96,8 @@ public class ExampleMod implements ModInitializer {
 		return new ServerStatus(status.description(), Optional.of(players), status.version(), status.favicon(), status.enforcesSecureChat());
 	}
 
-	public static ClientboundPlayerInfoUpdatePacket.Entry toEntry(NameAndId fake) {
-		GameProfile profile = new GameProfile(fake.id(), fake.name());
-		Component displayName = Component.literal(fake.name());
+	public static ClientboundPlayerInfoUpdatePacket.Entry toEntry(GameProfile profile) {
+		Component displayName = Component.literal(profile.name());
 		// Listed=true, latency=0, gamemode=survival, display name for tab, no hat, list order=0, no chat session
 		return new ClientboundPlayerInfoUpdatePacket.Entry(
 			profile.id(),
@@ -114,15 +112,15 @@ public class ExampleMod implements ModInitializer {
 		);
 	}
 
+	public static ClientboundPlayerInfoUpdatePacket.Entry toEntry(NameAndId fake) {
+		return toEntry(new GameProfile(fake.id(), fake.name()));
+	}
+
 	public static void refreshTabListForAllRealPlayers(net.minecraft.server.MinecraftServer server) {
 		int realCount = server.getPlayerList().getPlayerCount();
 		var fakeEntries = getFakeTabEntries();
 		int fakeCount = fakeEntries.size();
 		int total = realCount + fakeCount;
-		LOGGER.info("[FakePlayers] Refreshing tab list: real={}, fake={}, total={}", realCount, fakeCount, total);
-		for (var entry : fakeEntries) {
-			LOGGER.info("[FakePlayers] TAB entry: {} ({})", entry.profile().name(), entry.profile().id());
-		}
 
 		// Send header/footer with total count
 		Component header = Component.literal("Welcome");
@@ -152,10 +150,8 @@ public class ExampleMod implements ModInitializer {
 			);
 			var acc = (com.example.mixin.ClientboundPlayerInfoUpdatePacketAccessor) addPacket;
 			acc.setEntries(fakeEntries);
-			LOGGER.info("[FakePlayers] Packet entries about to send: {}", acc.getEntries().size());
 			viewer.connection.send(addPacket);
 			viewer.connection.send(tabPacket);
-			LOGGER.info("[FakePlayers] Sent tab refresh to {} ({} fake entries)", viewer.getGameProfile().name(), fakeEntries.size());
 		}
 	}
 }

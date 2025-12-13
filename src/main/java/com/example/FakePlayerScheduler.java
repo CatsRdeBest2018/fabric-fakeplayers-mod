@@ -4,6 +4,14 @@ import com.example.config.ActiveWindowConfig;
 import com.example.config.BotConfig;
 import com.example.config.FakePlayerConfig;
 import com.example.config.GlobalConfig;
+import com.google.common.collect.HashMultimap;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.mojang.authlib.GameProfile;
+import com.mojang.authlib.properties.Property;
+import com.mojang.authlib.properties.PropertyMap;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket;
@@ -13,6 +21,11 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.players.NameAndId;
 
 import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
@@ -25,6 +38,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -34,10 +48,28 @@ public class FakePlayerScheduler {
 	private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm");
 	private static final int LOGIN_STAGGER_SECONDS = 30;
 	private static final ZoneId EASTERN = ZoneId.of("America/New_York");
+	private static final List<String> DEATH_MESSAGES = List.of(
+		"%s fell from a high place",
+		"%s tried to swim in lava",
+		"%s was slain by Zombie",
+		"%s drowned",
+		"%s was shot by Skeleton",
+		"%s suffocated in a wall",
+		"%s was slain by Enderman",
+		"%s hit the ground too hard",
+		"%s burned to death",
+		"%s was slain by Spider",
+		"%s was impaled by Drowned",
+		"%s was blown up by Creeper"
+	);
 
 	private final List<FakePlayerProfile> profiles = new ArrayList<>();
 	private final List<PendingChat> pendingChats = new ArrayList<>();
 	private final Random random = new Random();
+	private final HttpClient httpClient = HttpClient.newBuilder()
+		.connectTimeout(Duration.ofSeconds(5))
+		.build();
+	private final java.util.Map<UUID, SkinTextures> textureCache = new ConcurrentHashMap<>();
 	private MinecraftServer server;
 	private boolean forcedOnline = false;
 	private GlobalConfig globalConfig = new GlobalConfig();
@@ -54,9 +86,10 @@ public class FakePlayerScheduler {
 	 */
 	public void applyConfig(MinecraftServer server, FakePlayerConfig config) {
 		this.server = server;
+		LocalDateTime now = currentEasternTime();
 		for (FakePlayerProfile profile : profiles) {
-			if (profile.online) {
-				sendRemove(profile);
+			if (profile.online || profile.inBreak) {
+				goOffline(profile, now);
 			}
 		}
 		this.globalConfig = normalizeGlobalConfig(config != null ? config.global : null);
@@ -102,6 +135,7 @@ public class FakePlayerScheduler {
 				profile.inBreak = false;
 				profile.breakUntil = null;
 				profile.nextBreakStart = null;
+				maybeTriggerDeath(profile, now);
 			}
 			deliverPendingChats(now);
 			return;
@@ -148,9 +182,41 @@ public class FakePlayerScheduler {
 					goOnline(profile, now, activeWindow, false);
 				}
 			}
+
+			if (profile.online) {
+				maybeTriggerDeath(profile, now);
+			}
 		}
 
 		deliverPendingChats(now);
+	}
+
+	public boolean enable() {
+		if (globalConfig == null) {
+			globalConfig = new GlobalConfig();
+		}
+		if (globalConfig.enabled) {
+			return false;
+		}
+		globalConfig.enabled = true;
+		resumeSchedule();
+		return true;
+	}
+
+	public boolean disable() {
+		if (globalConfig == null || !globalConfig.enabled) {
+			return false;
+		}
+		globalConfig.enabled = false;
+		forcedOnline = false;
+		LocalDateTime now = currentEasternTime();
+		for (FakePlayerProfile profile : profiles) {
+			if (profile.online || profile.inBreak) {
+				goOffline(profile, now);
+			}
+		}
+		pendingChats.clear();
+		return true;
 	}
 
 	public void handleRealPlayerJoin(ServerPlayer joining) {
@@ -207,16 +273,16 @@ public class FakePlayerScheduler {
 				profile.nextBreakStart,
 				profile.breakUntil,
 				profile.nextLogin,
-				profile.currentWindowEnd
+				profile.currentWindowEnd,
+				profile.nextDeath
 			));
 		}
 		return statuses;
 	}
 
-	public void forceOnlineAll() {
+	public boolean forceOnlineAll() {
 		if (globalConfig == null || !globalConfig.enabled) {
-			ExampleMod.LOGGER.info("[FakePlayers] Global fake players disabled; ignoring forceOnlineAll request.");
-			return;
+			return false;
 		}
 
 		this.forcedOnline = true;
@@ -226,8 +292,11 @@ public class FakePlayerScheduler {
 			profile.nextBreakStart = null;
 			if (!profile.online) {
 				goOnline(profile, currentEasternTime(), null, false);
+			} else if (profile.nextDeath == null) {
+				scheduleNextDeath(profile, currentEasternTime());
 			}
 		}
+		return true;
 	}
 
 	public void resumeSchedule() {
@@ -257,9 +326,11 @@ public class FakePlayerScheduler {
 			}
 			UUID id = resolveUuid(bot);
 			NameAndId nameAndId = new NameAndId(id, bot.name);
-			ClientboundPlayerInfoUpdatePacket.Entry entry = ExampleMod.toEntry(nameAndId);
-			FakePlayerProfile profile = new FakePlayerProfile(nameAndId, entry, windows);
-			profiles.add(profile);
+			GameProfile gameProfile = buildProfile(bot, id);
+			ClientboundPlayerInfoUpdatePacket.Entry entry = ExampleMod.toEntry(gameProfile);
+			FakePlayerProfile fakeProfile = new FakePlayerProfile(nameAndId, gameProfile, entry, windows);
+			fakeProfile.nextDeath = null;
+			profiles.add(fakeProfile);
 		}
 	}
 
@@ -281,6 +352,80 @@ public class FakePlayerScheduler {
 			}
 		}
 		return windows;
+	}
+
+	private GameProfile buildProfile(BotConfig bot, UUID id) {
+		var map = HashMultimap.<String, Property>create();
+		SkinTextures textures = resolveSkin(bot);
+		if (textures != null) {
+			map.put("textures", new Property("textures", textures.value(), textures.signature()));
+		}
+		return new GameProfile(id, bot.name, new PropertyMap(map));
+	}
+
+	private SkinTextures resolveSkin(BotConfig bot) {
+		// Explicit texture payload wins.
+		if (bot.textureValue != null && bot.textureSignature != null) {
+			return new SkinTextures(bot.textureValue, bot.textureSignature);
+		}
+		UUID skinUuid = parseUuid(bot.skinUuid);
+		if (skinUuid == null) {
+			return null;
+		}
+		SkinTextures cached = textureCache.get(skinUuid);
+		if (cached != null) {
+			return cached;
+		}
+		SkinTextures downloaded = downloadSkinTextures(skinUuid);
+		if (downloaded != null) {
+			textureCache.put(skinUuid, downloaded);
+		}
+		return downloaded;
+	}
+
+	private UUID parseUuid(String raw) {
+		if (raw == null || raw.isBlank()) {
+			return null;
+		}
+		try {
+			return UUID.fromString(raw);
+		} catch (IllegalArgumentException ignored) {
+			return null;
+		}
+	}
+
+	private SkinTextures downloadSkinTextures(UUID uuid) {
+		try {
+			String plain = uuid.toString().replace("-", "");
+			URI uri = URI.create("https://sessionserver.mojang.com/session/minecraft/profile/" + plain + "?unsigned=false");
+			HttpRequest request = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(5)).GET().build();
+			HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+			if (response.statusCode() != 200) {
+				return null;
+			}
+			JsonObject obj = JsonParser.parseString(response.body()).getAsJsonObject();
+			JsonArray props = obj.getAsJsonArray("properties");
+			if (props == null) {
+				return null;
+			}
+			for (JsonElement el : props) {
+				JsonObject prop = el.getAsJsonObject();
+				if (!prop.has("name") || !prop.get("name").getAsString().equals("textures")) {
+					continue;
+				}
+				if (!prop.has("value")) {
+					continue;
+				}
+				String value = prop.get("value").getAsString();
+				String sig = prop.has("signature") ? prop.get("signature").getAsString() : null;
+				if (value != null && sig != null) {
+					return new SkinTextures(value, sig);
+				}
+			}
+		} catch (Exception ignored) {
+			// Keep quiet; skin fetch failures fall back to default skin.
+		}
+		return null;
 	}
 
 	private UUID resolveUuid(BotConfig bot) {
@@ -320,6 +465,17 @@ public class FakePlayerScheduler {
 			config.minIntervalMinutes = config.maxIntervalMinutes;
 			config.maxIntervalMinutes = swap;
 		}
+		if (config.minDeathMinutes < 0) {
+			config.minDeathMinutes = 0;
+		}
+		if (config.maxDeathMinutes < 0) {
+			config.maxDeathMinutes = 0;
+		}
+		if (config.minDeathMinutes > config.maxDeathMinutes) {
+			int swap = config.minDeathMinutes;
+			config.minDeathMinutes = config.maxDeathMinutes;
+			config.maxDeathMinutes = swap;
+		}
 		return config;
 	}
 
@@ -354,6 +510,19 @@ public class FakePlayerScheduler {
 		}
 	}
 
+	private void scheduleNextDeath(FakePlayerProfile profile, LocalDateTime now) {
+		if (globalConfig == null || globalConfig.maxDeathMinutes <= 0) {
+			profile.nextDeath = null;
+			return;
+		}
+		int minutes = ThreadLocalRandom.current().nextInt(globalConfig.minDeathMinutes, globalConfig.maxDeathMinutes + 1);
+		// Avoid hammering chat if min is configured to 0; push at least 1 minute out.
+		if (minutes <= 0) {
+			minutes = 1;
+		}
+		profile.nextDeath = now.plusMinutes(minutes);
+	}
+
 	private void goOnline(FakePlayerProfile profile, LocalDateTime now, WindowInstance window, boolean fromBreak) {
 		if (profile.online) {
 			return;
@@ -366,6 +535,7 @@ public class FakePlayerScheduler {
 			profile.currentWindowEnd = window.end();
 		}
 		scheduleNextBreak(profile, now, window);
+		scheduleNextDeath(profile, now);
 		sendAddSnapshot();
 		sendJoinMessage(profile);
 		ExampleMod.refreshTabListForAllRealPlayers(this.server);
@@ -382,6 +552,7 @@ public class FakePlayerScheduler {
 		profile.nextLogin = null;
 		profile.nextBreakStart = null;
 		profile.currentWindowEnd = null;
+		profile.nextDeath = null;
 		if (wasOnline) {
 			sendRemove(profile);
 			sendLeaveMessage(profile);
@@ -403,6 +574,7 @@ public class FakePlayerScheduler {
 		profile.breakUntil = plannedEnd;
 		profile.nextLogin = plannedEnd;
 		profile.nextBreakStart = null;
+		profile.nextDeath = null;
 		sendRemove(profile);
 		sendLeaveMessage(profile);
 		ExampleMod.refreshTabListForAllRealPlayers(this.server);
@@ -442,8 +614,6 @@ public class FakePlayerScheduler {
 			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY,
 			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_DISPLAY_NAME
 		);
-		ExampleMod.LOGGER.info("[FakePlayers] sendAddSnapshot: fakeEntries={}", entries.size());
-		for (var e : entries) ExampleMod.LOGGER.info(" - {}", e.profile().name());
 
 		for (ServerPlayer viewer : this.server.getPlayerList().getPlayers()) {
 			ClientboundPlayerInfoUpdatePacket packet = new ClientboundPlayerInfoUpdatePacket(
@@ -452,9 +622,7 @@ public class FakePlayerScheduler {
 			);
 			var acc = (com.example.mixin.ClientboundPlayerInfoUpdatePacketAccessor) packet;
 			acc.setEntries(entries);
-			ExampleMod.LOGGER.info("[FakePlayers] Packet entries about to send: {}", acc.getEntries().size());
 			viewer.connection.send(packet);
-			ExampleMod.LOGGER.info("[FakePlayers] Sending {} fake tab entries to {}", entries.size(), viewer.getGameProfile().name());
 		}
 	}
 
@@ -474,8 +642,6 @@ public class FakePlayerScheduler {
 			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY,
 			ClientboundPlayerInfoUpdatePacket.Action.UPDATE_DISPLAY_NAME
 		);
-		ExampleMod.LOGGER.info("[FakePlayers] sendAddSnapshotTo: fakeEntries={}", entries.size());
-		for (var e : entries) ExampleMod.LOGGER.info(" - {}", e.profile().name());
 
 		ClientboundPlayerInfoUpdatePacket packet = new ClientboundPlayerInfoUpdatePacket(
 			actions,
@@ -483,9 +649,7 @@ public class FakePlayerScheduler {
 		);
 		var acc = (com.example.mixin.ClientboundPlayerInfoUpdatePacketAccessor) packet;
 		acc.setEntries(entries);
-		ExampleMod.LOGGER.info("[FakePlayers] Packet entries about to send: {}", acc.getEntries().size());
 		player.connection.send(packet);
-		ExampleMod.LOGGER.info("[FakePlayers] Sending {} fake tab entries to {}", entries.size(), player.getGameProfile().name());
 	}
 
 	private void sendRemove(FakePlayerProfile profile) {
@@ -512,14 +676,38 @@ public class FakePlayerScheduler {
 		this.server.getPlayerList().broadcastSystemMessage(msg, false);
 	}
 
+	private void sendDeathMessage(FakePlayerProfile profile) {
+		if (this.server == null) {
+			return;
+		}
+		String base = DEATH_MESSAGES.get(random.nextInt(DEATH_MESSAGES.size()));
+		String resolved = String.format(base, profile.nameAndId().name());
+		Component msg = Component.literal(resolved);
+		this.server.getPlayerList().broadcastSystemMessage(msg, false);
+	}
+
+	private void maybeTriggerDeath(FakePlayerProfile profile, LocalDateTime now) {
+		if (this.server == null || !profile.online || profile.nextDeath == null) {
+			return;
+		}
+		if (now.isBefore(profile.nextDeath)) {
+			return;
+		}
+		sendDeathMessage(profile);
+		scheduleNextDeath(profile, now);
+	}
+
 	private record PendingChat(LocalDateTime when, FakePlayerProfile speaker, String message) {}
 
 	private record ActiveWindow(LocalTime start, LocalTime end) {}
 
 	private record WindowInstance(LocalDateTime start, LocalDateTime end) {}
 
+	private record SkinTextures(String value, String signature) {}
+
 	private static class FakePlayerProfile {
 		private final NameAndId nameAndId;
+		private final GameProfile profile;
 		private final ClientboundPlayerInfoUpdatePacket.Entry entry;
 		private final List<ActiveWindow> activeWindows;
 		private boolean online = false;
@@ -528,9 +716,11 @@ public class FakePlayerScheduler {
 		private LocalDateTime nextLogin = null;
 		private LocalDateTime nextBreakStart = null;
 		private LocalDateTime currentWindowEnd = null;
+		private LocalDateTime nextDeath = null;
 
-		FakePlayerProfile(NameAndId nameAndId, ClientboundPlayerInfoUpdatePacket.Entry entry, List<ActiveWindow> activeWindows) {
+		FakePlayerProfile(NameAndId nameAndId, GameProfile profile, ClientboundPlayerInfoUpdatePacket.Entry entry, List<ActiveWindow> activeWindows) {
 			this.nameAndId = nameAndId;
+			this.profile = profile;
 			this.entry = entry;
 			this.activeWindows = activeWindows;
 		}
@@ -558,6 +748,7 @@ public class FakePlayerScheduler {
 			this.nextLogin = null;
 			this.nextBreakStart = null;
 			this.currentWindowEnd = null;
+			this.nextDeath = null;
 		}
 	}
 
@@ -570,6 +761,7 @@ public class FakePlayerScheduler {
 		LocalDateTime nextBreakStart,
 		LocalDateTime breakUntil,
 		LocalDateTime nextLogin,
-		LocalDateTime currentWindowEnd
+		LocalDateTime currentWindowEnd,
+		LocalDateTime nextDeath
 	) {}
 }

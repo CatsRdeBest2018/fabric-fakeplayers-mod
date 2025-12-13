@@ -1,9 +1,11 @@
 package com.example;
 
-import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.suggestion.Suggestions;
+import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerLoginConnectionEvents;
@@ -12,6 +14,7 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
+import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.network.ServerLoginPacketListenerImpl;
 import org.slf4j.Logger;
@@ -104,9 +107,8 @@ public final class SilentBlocker {
 	private static LiteralArgumentBuilder<CommandSourceStack> buildUnbanCommand() {
 		return literal("silentunban")
 			.requires(src -> src.hasPermission(3))
-			.then(argument("targets", net.minecraft.commands.arguments.EntityArgument.players())
-				.executes(SilentBlocker::executeUnbanTargets))
 			.then(argument("username", StringArgumentType.word())
+				.suggests(SilentBlocker::suggestBannedUsernames)
 				.executes(SilentBlocker::executeUnban));
 	}
 
@@ -167,24 +169,8 @@ public final class SilentBlocker {
 		return 0;
 	}
 
-	private static int executeUnbanTargets(CommandContext<CommandSourceStack> ctx) throws com.mojang.brigadier.exceptions.CommandSyntaxException {
-		var targets = net.minecraft.commands.arguments.EntityArgument.getPlayers(ctx, "targets");
-		int removed = 0;
-		for (var player : targets) {
-			String raw = player.getGameProfile().name();
-			String key = normalize(raw);
-			if (SILENT_BANNED.remove(key)) {
-				removed++;
-			}
-		}
-		if (removed > 0) {
-			saveToDisk();
-			final int total = removed;
-			ctx.getSource().sendSuccess(() -> Component.literal("Silently unbanned " + total + " player(s)."), false);
-			return removed;
-		}
-		ctx.getSource().sendFailure(Component.literal("None of the selected players were silently banned."));
-		return 0;
+	private static java.util.concurrent.CompletableFuture<Suggestions> suggestBannedUsernames(CommandContext<CommandSourceStack> ctx, SuggestionsBuilder builder) {
+		return SharedSuggestionProvider.suggest(SILENT_BANNED.stream().toList(), builder);
 	}
 
 	private static String normalize(String name) {

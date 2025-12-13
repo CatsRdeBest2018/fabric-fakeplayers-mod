@@ -104,6 +104,17 @@ public final class FakePlayerConfigManager {
 			config.global.minIntervalMinutes = config.global.maxIntervalMinutes;
 			config.global.maxIntervalMinutes = temp;
 		}
+		if (config.global.minDeathMinutes < 0) {
+			config.global.minDeathMinutes = 0;
+		}
+		if (config.global.maxDeathMinutes < 0) {
+			config.global.maxDeathMinutes = 0;
+		}
+		if (config.global.minDeathMinutes > config.global.maxDeathMinutes) {
+			int temp = config.global.minDeathMinutes;
+			config.global.minDeathMinutes = config.global.maxDeathMinutes;
+			config.global.maxDeathMinutes = temp;
+		}
 
 		if (config.bots == null) {
 			config.bots = new ArrayList<>();
