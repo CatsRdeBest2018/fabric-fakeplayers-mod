@@ -1,0 +1,17 @@
+{
+	"required": true,
+	"package": "com.example.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"mixins": [
+		"MinecraftServerStatusMixin",
+		"ClientboundPlayerInfoUpdatePacketAccessor",
+		"ServerGamePacketListenerImplMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"refmap": "modid.refmap.json",
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
