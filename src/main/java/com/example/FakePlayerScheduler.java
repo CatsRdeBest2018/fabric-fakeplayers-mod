@@ -368,6 +368,7 @@ public class FakePlayerScheduler {
 		if (bot.textureValue != null && bot.textureSignature != null) {
 			return new SkinTextures(bot.textureValue, bot.textureSignature);
 		}
+
 		UUID skinUuid = parseUuid(bot.skinUuid);
 		if (skinUuid == null) {
 			return null;
